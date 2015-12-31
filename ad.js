@@ -80,6 +80,8 @@ class tensor {
     this.id = id
     this.name = nm
     this._shape = shape}
+  accept(v) {
+    v.visitTensor(this)}
   shape() {
     return this._shape}
   evalInTrace(tr) {
@@ -201,11 +203,17 @@ class add extends binary {
 
 class sub extends binary {
   shortString() { return 'sub'}
+  accept(v) {
+    v.preBinary(this)
+    v.visitSub(this)
+    v.postBinary(this)}
   evaluateBinary(x, y) {
     if (typeof x == 'number' && typeof y == 'number')
       return x-y
     else
       return zipTensor(x, y, function (a,b) { return a-b})}
+  shape() {
+    return this.x.shape()}
   evalAdjointsInTrace(tr) {
     var o = tr.adjointForId(this.id)
     if (typeof o == 'number') {
@@ -349,6 +357,10 @@ class einsum extends nary {
     this.spec = spec
     this.parseSpec()
     this.checkShape()}
+  accept(v) {
+    v.preNary(this)
+    v.visitEinsum(this)
+    v.postNary(this)}
   parseSpec() {
     var a = this.spec.split('->')
     assert(a.length === 2)
@@ -524,6 +536,10 @@ class frobenius extends unary {
 
 class squaredSum extends unary {
   shortString() { return 'squaredSum'}
+  accept(v) {
+    v.preUnary(this)
+    v.visitSquaredSum(this)
+    v.postUnary(this)}
   evaluateUnary(t) {
     var sum = 0.0
     function desc(tt) {
@@ -552,6 +568,10 @@ class squaredSum extends unary {
 
 class sigmoid extends unary {
   shortString() { return 'sigmoid'}
+  accept(v) {
+    v.preUnary(this)
+    v.visitSigmoid(this)
+    v.postUnary(this)}
   shape() {
     return this.x.shape()}
   evaluateUnary(t) {
@@ -733,6 +753,12 @@ function arrayZipWithAdd(a, b) {
     res[i] = a[i] + b[i]
   return res}
 
+function arrayAny(ary, pred) {
+  for (var x of ary)
+    if (pred(x))
+      return true
+  return false}
+
 class valueVar {
   constructor(id, name) {
     this.id = id
@@ -845,5 +871,764 @@ export class instructionInterpreter {
     for (var insn of this.instructions) {
       console.log(insn.toString())
       insn.runWith(this)}}
+}
+
+export class asmjsCompiler {
+  constructor(t) {
+    this.idGenerator = t
+    this.allocPointer = 0
+    this.memoryOffsets = []
+    this.shapes = []
+    this.genvarId = 1
+    this.vars = {}
+    this.parts = []}
+
+  nextId() {
+    return this.idGenerator.nextId()}
+  
+  compile(expr, derivatives) {
+    // console.log(util.inspect(expr, 0, 10))
+
+    var c = new asmjsCompileValue(this)
+    c.compile(expr)
+    
+    var di = new identifyNeededAdjoints(expr, derivatives)
+    var neededAdjoints = di.find()
+    
+    var d = new asmjsCompileAdjoints(this, neededAdjoints)
+    d.compile(expr)
+    this.adjointTensorMap = d.adjointTensorMap
+    return generateAsmjs(this)}
+  genvar(prefix, low, high) {
+    var name = (prefix || '_v') + (this.genvarId++)
+    var v = {name: name}
+    if (low !== undefined) v.low = low
+    if (high !== undefined) v.high = high
+    this.vars[name] = v;
+    return v}
+  allocTensor(t) {
+    var sh = t.shape()
+    var mem = bytesForShape(sh)
+    if (this.memoryOffsets[t.id] !== undefined)
+      this.memoryOffsets[t.id]
+
+    var nm = t.shortString ? t.shortString() : t.name
+    this.memoryOffsets[t.id] = this.allocPointer
+    this.allocPointer += mem
+    this.shapes[t.id] = sh}
+
+  allocDouble(t) {
+    var mem = 8
+    if (this.memoryOffsets[t.id] !== undefined)
+      this.memoryOffsets[t.id]
+
+    var nm = t.shortString ? t.shortString() : t.name
+    this.memoryOffsets[t.id] = this.allocPointer
+    this.allocPointer += mem
+    this.shapes[t.id] = 1}
+  
+  emit(x) {
+    // console.log('emit')
+    // console.log(util.inspect(x, 0, 10))
+    this.parts.push(x)}
+
+}
+
+function mapObjectKeyValues(object, f) {
+  var res = {}
+  for (var nm in object)
+    res[nm] = f(nm, object[nm])
+  return res}
+
+const bytesForDouble = 8
+
+function shapeNumElements(shape) {
+  var prod = 1
+  for (var d of shape)
+    prod *= d
+  return prod}
+
+// everything is double for now
+function bytesForShape(shape) {
+  return shapeNumElements(shape) * bytesForDouble}
+
+class asmjsCompileValue {
+  constructor(c) {
+    this.compiler = c}
+  compile(expr) {
+    expr.accept(this)}
+  emit(x) {
+    this.compiler.emit(x)}
+  preUnary(f) {
+    // console.log(f.x)
+    f.x.accept(this)}
+  preBinary(f) {
+    // console.log(f.x)
+    f.x.accept(this)
+    // console.log(f.y)
+    f.y.accept(this)}
+  preNary(f) {
+    for (var x of f.args) {
+      // console.log(x)
+      x.accept(this)}}
+  postUnary(f) {}
+  postBinary(f) {}
+  postNary(f) {}
+
+  visitTensor(t) {
+    this.compiler.allocTensor(t)}
+  visitSub(f) {
+    this.compiler.allocTensor(f)
+    var sh = f.shape()
+    var vars = sh.map((dim) => this.compiler.genvar('_d', 0, dim))
+    var res = buildLoopForShape(
+      vars, sh,
+      buildTensorStore(f, vars,
+		       buildDoubleSub(
+			 buildTensorFetch(f.x, vars),
+			 buildTensorFetch(f.y, vars))))
+    this.emit(res)}
+  visitSquaredSum(f) {
+    this.compiler.allocDouble(f)
+    var sh = f.x.shape()
+    var vars = sh.map((dim) => this.compiler.genvar('_q', 0, dim))
+    var sum = this.compiler.genvar('_sum')
+    var res = buildBlock(
+      [ buildDeclareDoubleVar(sum, buildDoubleConstant(0.0)),
+	buildLoopForShape(
+	  vars, sh,
+	  buildDoubleAssignAdd(
+	    sum,
+	    buildDoubleSquare(buildTensorFetch(f.x, vars)))),
+	buildDoubleStore(f, buildReadVar(sum))])
+    this.emit(res)}
+  visitSigmoid(f) {
+    this.compiler.allocTensor(f)
+    var sh = f.x.shape()
+    var vars = sh.map((dim) => this.compiler.genvar('_s', 0, dim))
+    var res = buildLoopForShape(
+      vars, sh,
+      buildTensorStore(f, vars,
+		       buildSigmoid(
+			 buildTensorFetch(f.x, vars))))
+    this.emit(res)}
+  
+  visitEinsum(f) {
+    this.compiler.allocTensor(f)
+    var vars = mapObjectKeyValues(
+      f.dimensions,
+      (nm, dim) => this.compiler.genvar(nm, 0, dim))
+    var prod = 1
+    for (var i in f.inputs) {
+      prod = buildDoubleMul(
+	prod,
+	buildTensorFetch(
+	  f.args[i],
+	  Array.from(f.inputs[i]).map((v) => vars[v])))}
+    var sum = this.compiler.genvar('sum')
+    var innerLoop = buildDoubleAssignAdd(sum, prod)
+    for (var v of f.nonOutputVars())
+      innerLoop = buildCountedLoop(
+	vars[v], 0, f.dimensions[v], innerLoop)
+    var storeVars = Array.from(f.outputs).map((v) => vars[v])
+    var bl = buildBlock(
+      [ buildDeclareDoubleVar(sum, buildDoubleConstant(0.0)),
+	innerLoop,
+	buildTensorStore(f, storeVars,
+			 buildReadVar(sum))])
+    for (var v of f.outputs)
+      bl = buildCountedLoop(
+	vars[v], 0, f.dimensions[v], bl)
+
+    this.emit(bl)}
+  
+}
+
+class identifyNeededAdjoints {
+  constructor(expr, derivatives) {
+    this.expr = expr
+    this.derivatives = derivatives
+    this.derset = new Set(derivatives.map((d) => d.id))
+  }
+  find() {
+    this.expr.accept(this)
+    return this.derset}
+  isMarkedAsNeeded(variable) {
+    return this.derset.has(variable.id)}
+  markAsNeeded(variable) {
+    if (!this.isMarkedAsNeeded(variable)) {
+      // console.log('adding', variable.id,
+      //             'as needed for adjoints')
+      this.derset.add(variable.id)}}
+  preUnary(f) {
+    f.x.accept(this)
+    if (this.isMarkedAsNeeded(f.x))
+      this.markAsNeeded(f)}
+  preBinary(f) {
+    f.x.accept(this)
+    if (this.isMarkedAsNeeded(f.x))
+      this.markAsNeeded(f)
+    f.y.accept(this)
+    if (this.isMarkedAsNeeded(f.y))
+      this.markAsNeeded(f)}
+  preNary(f) {
+    for (var x of f.args) {
+      x.accept(this)
+      if (this.isMarkedAsNeeded(x))
+	this.markAsNeeded(f)}}
+  postUnary(f) {}
+  postBinary(f) {}
+  postNary(f) {}
+  visitTensor(t) {}
+  visitSub(f) {}
+  visitSquaredSum(f) {}
+  visitSigmoid(f) {}
+  visitEinsum(f) {}
+  
+}
+
+class adjointTensor {
+  constructor(id, shape) {
+    this.id = id
+    this._shape = shape}
+  shape() {
+    return this._shape}
+  toString() {
+    return '(adjointTensor ' + this.id + ')'}}
+
+class adjointDouble {
+  constructor(id) {
+    this.id = id}
+  shape() {
+    throw 'needed?'
+    return 1}
+  toString() {
+    return '(adjointDouble ' + this.id + ')'}}
+
+
+class asmjsCompileAdjoints {
+  constructor(c, neededAdjoints) {
+    this.compiler = c
+
+    // set of var id's that we need adjoints for
+    this.neededAdjoints = neededAdjoints
+    console.log(this.neededAdjoints)
+
+    // mapping tensor or op id to adjoint tensor
+    this.adjointTensorMap = new Map()
+    
+  }
+  compile(expr) {
+    // set top adjoint
+    var top = this.allocAdjointDouble(expr)
+    this.emit(buildDoubleStore(top, buildDoubleConstant(1.0)))
+      
+    expr.accept(this)}
+  emit(x) {
+    this.compiler.emit(x)}
+  preUnary(f) {}
+  preBinary(f) {}
+  preNary(f) {}
+
+  isNeeded(variable) {
+    return this.neededAdjoints.has(variable.id)}
+  
+  postUnary(f) {
+    if (this.isNeeded(f.x))
+      f.x.accept(this)}
+    
+  postBinary(f) {
+    if (this.isNeeded(f.x))
+      f.x.accept(this)
+    if (this.isNeeded(f.y))
+      f.y.accept(this)}
+  
+  postNary(f) {
+    for (var x of f.args) {
+      if (this.isNeeded(x))
+	x.accept(this)}}
+
+  isAdjointTensorAllocated(ot) {
+    return this.adjointTensorMap.has(ot.id)}
+  
+  getAdjointTensor(ot) {
+    assert(this.isAdjointTensorAllocated(ot))
+    return this.adjointTensorMap.get(ot.id)}
+  
+  allocAdjointTensor(ot) {
+    if (this.adjointTensorMap.has(ot.id))
+      return this.adjointTensorMap.get(ot.id)
+    var id = this.compiler.nextId()
+    var at = new adjointTensor(id, ot.shape())
+    this.adjointTensorMap.set(ot.id, at)
+    this.compiler.allocTensor(at)
+    return at}
+
+  allocAdjointDouble(ot) {
+    if (this.adjointTensorMap.has(ot.id))
+      return this.adjointTensorMap.get(ot.id)
+    var id = this.compiler.nextId()
+    var at = new adjointDouble(id)
+    this.adjointTensorMap.set(ot.id, at)
+    this.compiler.allocDouble(at)
+    return at}
+
+  emit(x) {
+    // console.log(util.inspect(x, 0, 9))
+    this.compiler.emit(x)}
+
+  visitTensor(t) { }
+
+  visitSquaredSum(f) {
+    if (!this.isNeeded(f.x)) return
+    var wasAllocated = this.isAdjointTensorAllocated(f.x)
+    var at = this.allocAdjointTensor(f.x)
+    /// console.log(f)
+    var sh = f.x.shape()
+    var vars = sh.map((dim) => this.compiler.genvar('_s', 0, dim))
+    var o = this.compiler.genvar('_o')
+    var declO = buildDeclareDoubleVar(o, buildDoubleConstant(0.0))
+    var getO = buildDoubleAssign(
+      o,
+      buildDoubleFetch(this.getAdjointTensor(f)))
+    var adjoint =
+	buildDoubleMul(
+	  buildDoubleConstant(2.0),
+	  buildDoubleMul(buildReadVar(o),
+			 buildTensorFetch(f.x, vars)))
+    var body = null
+    if (wasAllocated)
+      body = buildTensorIncrement(at, vars, adjoint)
+    else
+      body = buildTensorStore(at, vars, adjoint)
+    var loop = buildLoopForShape(vars, sh, body)
+    this.emit(buildBlock([declO, getO, loop]))}
+
+  visitSub(f) {
+    if (!this.isNeeded(f.x) && !this.isNeeded(f.y))
+      return
+    var fat = this.getAdjointTensor(f)
+    var sh = f.x.shape()
+    var vars = sh.map((dim) => this.compiler.genvar('_s', 0, dim))
+    var o = this.compiler.genvar('_o')
+    var declO = buildDeclareDoubleVar(o, buildDoubleConstant(0.0))
+
+    var getO = buildDoubleAssign(o, buildTensorFetch(fat, vars))
+    var adjointX = buildReadVar(o)
+    var adjointY = buildDoubleNeg(buildReadVar(o))
+
+    
+    var body = [declO, getO]
+    if (this.isNeeded(f.x)) {
+      var stox = null
+      var wasAllocatedX = this.isAdjointTensorAllocated(f.x)
+      var atx = this.allocAdjointTensor(f.x)
+      if (wasAllocatedX)
+	stox = buildTensorIncrement(atx, vars, adjointX)
+      else
+	stox = buildTensorStore(atx, vars, adjointX)
+      body.push(stox)}
+
+    if (this.isNeeded(f.y)) {
+      var stoy = null
+      var wasAllocatedY = this.isAdjointTensorAllocated(f.y)
+      var aty = this.allocAdjointTensor(f.y)
+      if (wasAllocatedY)
+	stoy = buildTensorIncrement(aty, vars, adjointY)
+      else
+	stoy = buildTensorStore(aty, vars, adjointY)
+      body.push(stoy)}
+
+    this.emit(buildLoopForShape(vars, sh, buildBlock(body)))
+  }
+
+  visitSigmoid(f) {
+    if (!this.isNeeded(f.x))
+      return
+    var fat = this.getAdjointTensor(f)
+    var sh = f.x.shape()
+    var vars = sh.map((dim) => this.compiler.genvar('_s', 0, dim))
+
+    var o = this.compiler.genvar('_o')
+    var declO = buildDeclareDoubleVar(o, buildDoubleConstant(0.0))
+    var getO = buildDoubleAssign(o, buildTensorFetch(f, vars))
+    
+    var adjoint =
+	buildDoubleMul(
+	  buildTensorFetch(fat, vars),
+	  buildDoubleMul(
+	    buildReadVar(o),
+	    buildDoubleSub(buildDoubleConstant(1.0),
+			   buildReadVar(o))))
+    
+    var body = [declO, getO]
+    var wasAllocated = this.isAdjointTensorAllocated(f.x)
+    var at = this.allocAdjointTensor(f.x)
+    var sto = null
+    if (wasAllocated)
+      sto = buildTensorIncrement(at, vars, adjoint)
+    else
+      sto = buildTensorStore(at, vars, adjoint)
+    body.push(sto)
+
+    this.emit(buildLoopForShape(vars, sh, buildBlock(body)))}
+
+
+  visitEinsum(f) {
+    if (!arrayAny(f.args, (a) => this.isNeeded(a)))
+      return
+
+    for (var ii in f.args) {
+      var arg = f.args[ii]
+      if (this.isNeeded(arg)) {
+	var wasAllocated = this.isAdjointTensorAllocated(arg)
+	var at = this.allocAdjointTensor(arg)
+	if (!wasAllocated)
+	  this.emit(buildClearTensor(at))}}
+
+    var statements = []
+    var dimensions = f.dimensions
+    var loopvars = mapObjectKeyValues(
+      f.dimensions,
+      (nm, dim) => this.compiler.genvar(nm, 0, dim))
+    var o = this.compiler.genvar('o')
+    for (var ii in f.args) {
+      var arg = f.args[ii]
+      if (!this.isNeeded(arg))
+	continue
+      var ins = f.inputs[ii]
+      var prod = buildReadVar(o)
+      for (var j in f.args) {
+	if (j !== ii) {
+	  prod = buildDoubleMul(
+	    prod,
+	    buildTensorFetch(
+	      f.args[j],
+	      Array.from(f.inputs[j]).map((nm) => loopvars[nm])))}}
+      statements.push(
+	buildTensorIncrement(
+	  this.getAdjointTensor(arg),
+	  Array.from(f.inputs[ii]).map((nm) => loopvars[nm]),
+	  prod))}
+
+    // inner loops
+    var innerLoops =
+	buildLoopForShape(
+	  f.nonOutputVars().map((nm) => loopvars[nm]),
+	  f.nonOutputVars().map((nm) => dimensions[nm]),
+	  buildBlock(statements))
+
+    var os = Array.from(f.outputs)
+
+    var olstatements = []
+    olstatements.push(
+      buildDeclareDoubleVar(o, buildDoubleConstant(0.0)))
+    olstatements.push(
+      buildDoubleAssign(
+	o,
+	buildTensorFetch(
+	  this.getAdjointTensor(f),
+	  os.map((nm) => loopvars[nm]))))
+    olstatements.push(innerLoops)
+
+    var outerLoops =
+	buildLoopForShape(
+	  os.map((nm) => loopvars[nm]),
+	  os.map((nm) => dimensions[nm]),
+	  buildBlock(olstatements))
+    this.emit(outerLoops)}
+}
+
+function buildDoubleConstant(x) {
+  assert(typeof x == 'number')
+  return {op: 'doubleConstant', value: x}}
+
+function buildDoubleAssignAdd(a, b) {
+  return {op:'doubleAssignAdd', a: a, b: b}}
+
+function buildDoubleAssign(a, b) {
+  return {op:'doubleAssign', a: a, b: b}}
+
+function buildDeclareDoubleVar(a, b) {
+  return {op:'declareDoubleVar', a: a, b: b}}
+
+function buildDoubleNeg(a) {
+  return {op: 'doubleNeg', a: a}}
+
+function buildDoubleSub(a, b) {
+  return {op: 'doubleSub', a: a, b: b}}
+
+function buildDoubleMul(a, b) {
+  if (a === 1)
+    return b
+  if (b === 1)
+    return a
+  return {op: 'doubleMul', a: a, b: b}}
+
+function buildDoubleSquare(a) {
+  return {op: 'doubleSquare', a: a}}
+
+function buildSigmoid(a) {
+  return {op: 'sigmoid', a:a}}
+
+function buildTensorFetch(t, vs) {
+  return {op: 'tensorFetch',
+	  tensor: t,
+	  vars: vs}}
+
+function buildTensorStore(t, vs, value) {
+  return {op: 'tensorStore',
+	  tensor: t,
+	  vars: vs,
+	  value: value}}
+
+function buildTensorIncrement(t, vs, value) {
+  return {op: 'tensorIncrement',
+	  tensor: t,
+	  vars: vs,
+	  value: value}}
+
+function buildClearTensor(t) {
+  return {op: 'clearTensor',
+	  tensor: t}}
+
+function buildDoubleFetch(dest) {
+  return {op: 'doubleFetch',
+	  dest: dest}}
+
+function buildDoubleStore(dest, value) {
+  return {op: 'doubleStore',
+	  dest: dest,
+	  value: value}}
+
+function buildCountedLoop(variable, start, end, body) {
+  return {op:'countedLoop',
+	  variable: variable,
+	  start: start,
+	  end: end,
+	  body: body}}
+
+function buildLoopForShape(vars, shape, body) {
+  if (vars.length == 0)
+    return body
+  return buildCountedLoop(
+    vars[0], 0, shape[0],
+    buildLoopForShape(vars.slice(1), shape.slice(1), body))}
+  
+
+function buildBlock(stmts) {
+  return {op: 'block', statements: stmts}}
+
+function buildReadVar(variable) {
+  return {op: 'readVar', variable: variable}}
+
+function generateAsmjs(c) {
+  var res = []
+  var indent = 2
+  function emit(x) {
+    var ind = []
+    for (var i = 0; i < indent; i++)
+      ind.push('  ')
+    res.push(ind.join('') + x)}
+
+  function gen(p) {
+    ///// emit('/*\n' + util.inspect(p) + '*/')
+    if (p.op == 'countedLoop') {
+      var v = p.variable.name
+      emit('for (var ' + v + ' = ' + p.start + '; '
+	   + v + ' < ' + p.end + '; '
+	   + v + '++) {')
+      indent++;
+      gen(p.body)
+      indent--;
+      emit('}')}
+    else if (p.op == 'block') {
+      for (var part of p.statements)
+	gen(part)}
+    else if (p.op == 'declareDoubleVar') {
+      emit('var ' + p.a.name + ' =')
+      indent++
+      gen(p.b)
+      indent--}
+    else if (p.op == 'doubleAssign') {
+      emit(p.a.name + ' =')
+      indent++
+      gen(p.b)
+      indent--}
+    else if (p.op == 'doubleAssignAdd') {
+      emit(p.a.name + ' +=')
+      indent++
+      gen(p.b)
+      indent--}
+    else if (p.op == 'doubleConstant') {
+      var s = '' + p.value
+      if (s.indexOf('.') < 0)
+	s += '.0'
+      emit(s)}
+    else if (p.op == 'doubleMul') {
+      emit('+(')
+      indent++
+      gen(p.a)
+      emit('*')
+      gen(p.b)
+      indent--
+      emit(')')}
+    else if (p.op == 'doubleSub') {
+      emit('+(')
+      indent++
+      gen(p.a)
+      emit('-')
+      gen(p.b)
+      indent--
+      emit(')')}
+    else if (p.op == 'doubleNeg') {
+      emit('+(-')
+      indent++
+      gen(p.a)
+      indent--
+      emit(')')}
+    else if (p.op == 'doubleSquare') {
+      emit('Math.pow(')
+      indent++
+      gen(p.a)
+      emit(',2)')
+      indent--}
+    else if (p.op == 'tensorFetch'
+	     || p.op == 'tensorStore'
+	     || p.op == 'tensorIncrement') {
+      var incr = p.op == 'tensorIncrement'
+      var store = incr || p.op == 'tensorStore'
+      var t = p.tensor
+      var sh = t.shape()
+      var ofs = c.memoryOffsets[t.id]
+      var str = (store?'':'+') + 'fheap[(' + ofs
+      var q = shapeNumElements(sh)
+      for (var i in p.vars) {
+	var v = p.vars[i]
+	var s = sh[i]
+	q /= s
+	str += ' + ' + q + '*' + bytesForDouble + '*' + v.name}
+      str += ')>>3]'
+      if (store)
+	str += incr ? ' += ' : ' = '
+      str +=
+	' /*'
+	+ (t.shortString ? t.shortString() : t.name || t.id)
+	+ '*/'
+      emit(str)
+      if (store) {
+	indent++
+	gen(p.value)
+	indent--}}
+    else if (p.op == 'clearTensor') {
+      var t = p.tensor
+      var ofs = c.memoryOffsets[t.id]
+      var v = '_i' + t.id
+      var b = bytesForDouble
+      var lim = shapeNumElements(t.shape())
+      emit('for (var ' + v + ' = 0; '
+	   + v + ' < ' + lim + '*'+b+'; '
+	   + v +' += ' + b + ')')
+      indent++;
+      emit('fheap[('+ofs+'+'+v+')>>3] = 0.0')
+      indent--}
+    else if (p.op == 'doubleStore') {
+      var ofs = c.memoryOffsets[p.dest.id]
+      emit('fheap[' + ofs + '>>3] =')
+      indent++
+      gen(p.value)
+      indent--}
+    else if (p.op == 'doubleFetch') {
+      var ofs = c.memoryOffsets[p.dest.id]
+      emit('+fheap[' + ofs + '>>3]')}
+    else if (p.op == 'readVar')
+      emit(p.variable.name)
+    else if (p.op == 'sigmoid') {
+      emit('1.0 / (1.0 + Math.exp(-')
+      indent++
+      gen(p.a)
+      indent--
+      emit('))')}
+    else
+      emit(util.inspect(p))
+  }
+
+  for (var part of c.parts)
+    gen(part)
+
+  res.unshift("  function func() {")
+  res.unshift("  var fheap = new stdlib.Float64Array(heap)")
+  res.unshift("  \"use asm\";")
+  res.unshift("function module(stdlib, foreign, heap) {")
+
+  res.push("    }")
+  res.push("  return {func: func}")
+  res.push("}")
+  res.push("module")
+  res = res.join('\n')
+  /// console.log(res)
+  return new compiledFunction(
+    eval(res),
+    c.shapes,
+    c.memoryOffsets,
+    c.allocPointer,
+    c.adjointTensorMap)}
+
+class compiledFunction {
+  constructor(module, shapes, memoryOffsets,
+	      memoryNeed, adjointTensorMap) {
+    this.module = module
+    this.shapes = shapes
+    this.memoryOffsets = memoryOffsets
+    this.memoryNeed = memoryNeed
+    this.adjointTensorMap = adjointTensorMap
+    this.heap = new ArrayBuffer(memoryNeed)
+    this.fheap = new Float64Array(this.heap)
+    var stdlib = { Math: Math,
+		   Float64Array: Float64Array}
+    var foreign = {}
+    this.moduleInstance = this.module(stdlib, foreign, this.heap)}
+
+  // todo: maybe rename to 'pass', as in "passing an argument"
+  bind(variable, value) {
+    var sh = this.shapes[variable.id]
+    var ptr = this.memoryOffsets[variable.id] / bytesForDouble
+    var fheap = this.fheap
+    function desc(depth, x) {
+      if (typeof x === 'number')
+	fheap[ptr++] = x
+      else {
+	assert(x.length === sh[depth])
+	for (var a of x)
+	  desc(depth+1, a)}}
+    desc(0, value)
+  }
+
+  valueForId(id) {
+    var sh = this.shapes[id]
+    var ptr = this.memoryOffsets[id] / bytesForDouble
+    var fheap = this.fheap
+    function desc(depth) {
+      if (depth === sh.length)
+	return fheap[ptr++]
+      else {
+	var l = sh[depth]
+	var res = new Array()
+	for (var i = 0; i < l; i++)
+	  res[i] = desc(depth+1)
+	return res}}
+    if (sh === 1)
+      return fheap[ptr]
+    else
+      return desc(0)}
+
+  adjointForId(id) {
+    var adj = this.adjointTensorMap.get(id)
+    // console.log('adjoint for', id, ' -> ', adj)
+    return this.valueForId(adj.id)}
+
+  call() {
+    this.moduleInstance.func()
+  }
 }
 
