@@ -41,9 +41,9 @@ function someAutoencoderExample() {
   var noiseLevel = 0.4
   
   var t = new T()
-  var minibatchSize = 100
-  var dataSize = 100
-  var numFilters = 11
+  var minibatchSize = 10
+  var dataSize = 200
+  var numFilters = 200
   var learnRate = 0.01
 
   var origInput = t.tensor('input', [minibatchSize, dataSize])
@@ -86,7 +86,7 @@ function someAutoencoderExample() {
     
     tr.bind(origInput, data)
     tr.bind(filters, filtersT)
-    
+
     if (denoising) {
       var nl = noiseLevel
       if (count % 20 === 19) {
@@ -102,6 +102,9 @@ function someAutoencoderExample() {
     else
       tr.call()
 
+    var end = +new Date()
+    var spent = end - start
+
     // console.log('updates:')
     // console.log(tr.adjointForId(filters.id))
     
@@ -109,13 +112,12 @@ function someAutoencoderExample() {
     			 tr.adjointForId(filters.id),
     			 (a,b) => a-learnRate*b)
 
-    var end = +new Date()
-    var spent = end - start
-    console.log(count, 'err', tr.valueForId(err.id), spent)
+    if (Math.random() < 0.1 || count < 20)
+      console.log(count, 'err', tr.valueForId(err.id), spent)
     // if (count % 100 === 0)
     //   console.log(filtersT)
       
-    if (count++ == 100000)
+    if (count++ == 200)
       break}}
 
 someAutoencoderExample()

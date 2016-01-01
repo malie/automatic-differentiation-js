@@ -1431,13 +1431,16 @@ function generateAsmjs(c) {
       ind.push('  ')
     res.push(ind.join('') + x)}
 
+  var intvars = new Set()
+  var doublevars = new Set()
   function gen(p) {
     ///// emit('/*\n' + util.inspect(p) + '*/')
     if (p.op == 'countedLoop') {
       var v = p.variable.name
-      emit('for (var ' + v + ' = ' + p.start + '; '
-	   + v + ' < ' + p.end + '; '
-	   + v + '++) {')
+      emit('for (' + v + ' = ' + p.start + '; '
+	   + '(' + v + '|0) < (' + p.end + '|0); '
+	   + v + '= ((' + v + '+1)|0)) {')
+      intvars.add(v)
       indent++;
       gen(p.body)
       indent--;
@@ -1446,7 +1449,8 @@ function generateAsmjs(c) {
       for (var part of p.statements)
 	gen(part)}
     else if (p.op == 'declareDoubleVar') {
-      emit('var ' + p.a.name + ' =')
+      doublevars.add(p.a.name)
+      emit(p.a.name + ' =')
       indent++
       gen(p.b)
       indent--}
@@ -1456,10 +1460,11 @@ function generateAsmjs(c) {
       gen(p.b)
       indent--}
     else if (p.op == 'doubleAssignAdd') {
-      emit(p.a.name + ' +=')
+      emit(p.a.name + ' = +(' + p.a.name + ' + ')
       indent++
       gen(p.b)
-      indent--}
+      indent--
+      emit(')')}
     else if (p.op == 'doubleConstant') {
       var s = '' + p.value
       if (s.indexOf('.') < 0)
@@ -1488,10 +1493,10 @@ function generateAsmjs(c) {
       indent--
       emit(')')}
     else if (p.op == 'doubleSquare') {
-      emit('Math.pow(')
+      emit('pow(')
       indent++
       gen(p.a)
-      emit(',2)')
+      emit(',2.0)')
       indent--}
     else if (p.op == 'tensorFetch'
 	     || p.op == 'tensorStore'
@@ -1507,10 +1512,10 @@ function generateAsmjs(c) {
 	var v = p.vars[i]
 	var s = sh[i]
 	q /= s
-	str += ' + ' + q + '*' + bytesForDouble + '*' + v.name}
+	str += ' + (' + q*bytesForDouble + '*' + v.name + '|0)'}
       str += ')>>3]'
       if (store)
-	str += incr ? ' += ' : ' = '
+	str += !incr ? " = " : (' = +(' + str + ' + ')
       str +=
 	' /*'
 	+ (t.shortString ? t.shortString() : t.name || t.id)
@@ -1519,16 +1524,19 @@ function generateAsmjs(c) {
       if (store) {
 	indent++
 	gen(p.value)
-	indent--}}
+	indent--
+	if (incr)
+	  emit(')')}}
     else if (p.op == 'clearTensor') {
       var t = p.tensor
       var ofs = c.memoryOffsets[t.id]
       var v = '_i' + t.id
       var b = bytesForDouble
-      var lim = shapeNumElements(t.shape())
-      emit('for (var ' + v + ' = 0; '
-	   + v + ' < ' + lim + '*'+b+'; '
-	   + v +' += ' + b + ')')
+      var lim = shapeNumElements(t.shape())*b
+      emit('for (' + v + ' = 0; '
+	   + '(' + v + '|0) < (' + lim +'|0); '
+	   + v +' = (' + v + '+' + b + ')|0)')
+      intvars.add(v)
       indent++;
       emit('fheap[('+ofs+'+'+v+')>>3] = 0.0')
       indent--}
@@ -1544,7 +1552,7 @@ function generateAsmjs(c) {
     else if (p.op == 'readVar')
       emit(p.variable.name)
     else if (p.op == 'sigmoid') {
-      emit('1.0 / (1.0 + Math.exp(-')
+      emit('1.0 / (1.0 + exp(-')
       indent++
       gen(p.a)
       indent--
@@ -1556,8 +1564,15 @@ function generateAsmjs(c) {
   for (var part of c.parts)
     gen(part)
 
+  for (var iv of intvars)
+    res.unshift('    var ' + iv + ' = 0')
+  for (var dv of doublevars)
+    res.unshift('    var ' + dv + ' = 0.0')
+  
   res.unshift("  function func() {")
   res.unshift("  var fheap = new stdlib.Float64Array(heap)")
+  res.unshift('  var exp = stdlib.Math.exp')
+  res.unshift('  var pow = stdlib.Math.pow')
   res.unshift("  \"use asm\";")
   res.unshift("function module(stdlib, foreign, heap) {")
 
@@ -1566,13 +1581,19 @@ function generateAsmjs(c) {
   res.push("}")
   res.push("module")
   res = res.join('\n')
-  /// console.log(res)
+  // console.log(res)
   return new compiledFunction(
     eval(res),
     c.shapes,
     c.memoryOffsets,
     c.allocPointer,
     c.adjointTensorMap)}
+
+function nextPowerOfTwo(a) {
+  var res = 1
+  while (res < a)
+    res *= 2
+  return res}
 
 class compiledFunction {
   constructor(module, shapes, memoryOffsets,
@@ -1582,7 +1603,7 @@ class compiledFunction {
     this.memoryOffsets = memoryOffsets
     this.memoryNeed = memoryNeed
     this.adjointTensorMap = adjointTensorMap
-    this.heap = new ArrayBuffer(memoryNeed)
+    this.heap = new ArrayBuffer(nextPowerOfTwo(memoryNeed))
     this.fheap = new Float64Array(this.heap)
     var stdlib = { Math: Math,
 		   Float64Array: Float64Array}
