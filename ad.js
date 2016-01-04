@@ -1,3 +1,7 @@
+// todo: reuse calculated index for doubleAssignAdd
+// todo: major cleanup
+//       compileValue, compileAdjointsWith, class compiler
+
 "use strict";
 var assert = require('assert')
 var util = require('util')
@@ -44,6 +48,8 @@ export class T {
     return new squaredSum(this.nextId(), t)}
   sigmoid(t) {
     return new sigmoid(this.nextId(), t)}
+  ones(sh) {
+    return new ones(this.nextId(), sh)}
 }
 
 
@@ -184,12 +190,25 @@ class nary {
 
 class add extends binary {
   shortString() { return 'add'}
+  accept(v) {
+    v.preBinary(this)
+    v.visitAdd(this)
+    v.postBinary(this)}
   evaluateBinary(x, y) {
-    return x+y}
+    if (typeof x == 'number' && typeof y == 'number')
+      return x+y
+    else
+      return zipTensor(x, y, function (a,b) { return a+b})}
+  shape() {
+    return this.x.shape()}
   evalAdjointsInTrace(tr) {
     var o = tr.adjointForId(this.id)
-    tr.addAdjoint(this.x, o)
-    tr.addAdjoint(this.y, o)
+    if (typeof o == 'number') {
+      tr.addAdjoint(this.x, o)
+      tr.addAdjoint(this.y, o)}
+    else {
+      tr.addTensorAdjoint(this.x, o)
+      tr.addTensorAdjoint(this.y, o)}
     this.x.evalAdjointsInTrace(tr)
     this.y.evalAdjointsInTrace(tr)}
   cloneForOperands(t, x, y) {
@@ -377,8 +396,12 @@ class einsum extends nary {
       for (var li in input) {
 	let letter = input[li]
 	let size = sh[li]
-	if (letter in this.dimensions)
-	  assert.equal(this.dimensions[letter], size)
+	if (letter in this.dimensions) {
+	  if (this.dimensions[letter] !== size) {
+	    console.log(util.inspect(this, 0, 7))
+	    console.log('einsum check shape bad dimensions for letter',
+			letter, size, this.dimensions[letter])
+	    throw 'einsum checkShape'}}
 	else
 	  this.dimensions[letter] = size}}
     var odims = []
@@ -595,6 +618,19 @@ class sigmoid extends unary {
   compileAdjointsWith(c) {
     throw 'todo'}}
 
+class ones {
+  constructor(id, sh) {
+    this.id = id
+    this._shape = sh}
+  shortString() { return 'ones'}
+  accept(v) {
+    v.visitOnes(this)}
+  shape() {
+    return this._shape}
+  evalInTrace(tr) {
+    return onesTensor(this._shape)}
+  evalAdjointsInTrace(tr) {}}
+
 
 // Arrays of Arrays Tensor Implementation
 
@@ -611,6 +647,21 @@ export function zerosTensor(shape) {
     var res = new Array(l)
     for (var i = 0; i < l; i++)
       res[i] = zerosTensor(restShape)
+    return res}}
+
+export function onesTensor(shape) {
+  if (shape.length === 1) {
+    var l = shape[0]
+    var res = new Array(l)
+    for (var i = 0; i < l; i++)
+      res[i] = 1.0
+    return res}
+  else {
+    var l = shape[0]
+    var restShape = shape.slice(1)
+    var res = new Array(l)
+    for (var i = 0; i < l; i++)
+      res[i] = onesTensor(restShape)
     return res}}
 
 export function generateTensor(shape, f) {
@@ -942,7 +993,7 @@ function mapObjectKeyValues(object, f) {
 
 const bytesForDouble = 8
 
-function shapeNumElements(shape) {
+export function shapeNumElements(shape) {
   var prod = 1
   for (var d of shape)
     prod *= d
@@ -977,17 +1028,34 @@ class asmjsCompileValue {
 
   visitTensor(t) {
     this.compiler.allocTensor(t)}
+
+  visitOnes(f) {
+    this.compiler.allocTensor(f)
+    var sh = f.shape()
+    var vars = sh.map((dim) => this.compiler.genvar('_d', 0, dim))
+    var res = buildLoopForShape(
+      vars, sh,
+      buildTensorStore(f, vars, buildDoubleConstant(1.0)))
+    this.emit(res)}
+
+  visitAdd(f) {
+    this.binaryOperation(f, buildDoubleAdd)}
+
   visitSub(f) {
+    this.binaryOperation(f, buildDoubleSub)}
+
+  binaryOperation(f, buildOp) {
     this.compiler.allocTensor(f)
     var sh = f.shape()
     var vars = sh.map((dim) => this.compiler.genvar('_d', 0, dim))
     var res = buildLoopForShape(
       vars, sh,
       buildTensorStore(f, vars,
-		       buildDoubleSub(
+		       buildOp(
 			 buildTensorFetch(f.x, vars),
 			 buildTensorFetch(f.y, vars))))
     this.emit(res)}
+  
   visitSquaredSum(f) {
     this.compiler.allocDouble(f)
     var sh = f.x.shape()
@@ -1080,6 +1148,8 @@ class identifyNeededAdjoints {
   postBinary(f) {}
   postNary(f) {}
   visitTensor(t) {}
+  visitOnes(f) {}
+  visitAdd(f) {}
   visitSub(f) {}
   visitSquaredSum(f) {}
   visitSigmoid(f) {}
@@ -1162,6 +1232,7 @@ class asmjsCompileAdjoints {
     var at = new adjointTensor(id, ot.shape())
     this.adjointTensorMap.set(ot.id, at)
     this.compiler.allocTensor(at)
+    console.log('adjoint for', ot.id, 'is', at)
     return at}
 
   allocAdjointDouble(ot) {
@@ -1204,7 +1275,19 @@ class asmjsCompileAdjoints {
     var loop = buildLoopForShape(vars, sh, body)
     this.emit(buildBlock([declO, getO, loop]))}
 
+  visitOnes(f) {
+    throw 'shouldnt be needed'}
+
+  visitAdd(f) {
+    this.derAddivite(f,
+		       (a) => a,
+		       (a) => a)}
   visitSub(f) {
+    this.derAddivite(f,
+		       (a) => a,
+		       (a) => buildDoubleNeg(a))}
+
+  derAddivite(f, first, second) {
     if (!this.isNeeded(f.x) && !this.isNeeded(f.y))
       return
     var fat = this.getAdjointTensor(f)
@@ -1214,9 +1297,8 @@ class asmjsCompileAdjoints {
     var declO = buildDeclareDoubleVar(o, buildDoubleConstant(0.0))
 
     var getO = buildDoubleAssign(o, buildTensorFetch(fat, vars))
-    var adjointX = buildReadVar(o)
-    var adjointY = buildDoubleNeg(buildReadVar(o))
-
+    var adjointX = first(buildReadVar(o))
+    var adjointY = second(buildReadVar(o))
     
     var body = [declO, getO]
     if (this.isNeeded(f.x)) {
@@ -1355,6 +1437,9 @@ function buildDeclareDoubleVar(a, b) {
 function buildDoubleNeg(a) {
   return {op: 'doubleNeg', a: a}}
 
+function buildDoubleAdd(a, b) {
+  return {op: 'doubleAdd', a: a, b: b}}
+
 function buildDoubleSub(a, b) {
   return {op: 'doubleSub', a: a, b: b}}
 
@@ -1475,6 +1560,14 @@ function generateAsmjs(c) {
       indent++
       gen(p.a)
       emit('*')
+      gen(p.b)
+      indent--
+      emit(')')}
+    else if (p.op == 'doubleAdd') {
+      emit('+(')
+      indent++
+      gen(p.a)
+      emit('+')
       gen(p.b)
       indent--
       emit(')')}
@@ -1603,7 +1696,9 @@ class compiledFunction {
     this.memoryOffsets = memoryOffsets
     this.memoryNeed = memoryNeed
     this.adjointTensorMap = adjointTensorMap
-    this.heap = new ArrayBuffer(nextPowerOfTwo(memoryNeed))
+    var m2 = nextPowerOfTwo(memoryNeed)
+    console.log('using', m2, 'bytes of memory')
+    this.heap = new ArrayBuffer(m2)
     this.fheap = new Float64Array(this.heap)
     var stdlib = { Math: Math,
 		   Float64Array: Float64Array}
@@ -1645,7 +1740,9 @@ class compiledFunction {
 
   adjointForId(id) {
     var adj = this.adjointTensorMap.get(id)
-    // console.log('adjoint for', id, ' -> ', adj)
+    if (!adj) {
+      console.log('found no adjoint for ' + id)
+      throw 'err'}
     return this.valueForId(adj.id)}
 
   call() {
