@@ -10,11 +10,11 @@ global wholeText
 def readTextFile():
     global wholeText
     with open('pg76.txt', 'r') as textfile:
-        wholeText = textfile.read()
+        wholeText = textfile.read().replace('\n', ' ').replace('\r', ' ')
 
 global numChars, charmap, unknownChar
 global characters
-characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ \n\r,.:;\'"-()?! '
+characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ ,.:;\'"-()?! '
 
 def initCharmap():
     global numChars, charmap, unknownChar, characters
@@ -28,11 +28,19 @@ def lookupChar(c):
         return charmap[u]
     else:
         return unknownChar
+
+def charidToChar(c):
+    if c < len(characters):
+        return characters[c]
+    else:
+        return '%'
         
 def prepareMinibatch(minibatchSize, contextSize, forTraining):
     global wholeText
     inputs = np.zeros([minibatchSize, contextSize*numChars])
     outputs = np.zeros([minibatchSize], dtype=np.int32)
+    inputTexts = []
+    outputTexts = []
     res = []
     for b in range(minibatchSize):
         while True:
@@ -43,9 +51,12 @@ def prepareMinibatch(minibatchSize, contextSize, forTraining):
             for i in range(contextSize):
                 ch = lookupChar(wholeText[start+i])
                 inputs[b, ch] = 1
-            outputs[b] = lookupChar(wholeText[start+contextSize])
+            end = start + contextSize
+            outputs[b] = lookupChar(wholeText[end])
+            inputTexts.append(wholeText[start:end])
+            outputTexts.append(wholeText[end:end+1])
             break
-    return (inputs, outputs)
+    return (inputs, outputs, inputTexts, outputTexts)
 
 class inputLayer:
     def __init__(self, numInputs):
@@ -65,10 +76,10 @@ class layer(object):
         self.rng = rng
         dataSize = below.numOutputs()
         self.initial_weights = np.asarray(
-                rng.uniform(low=-0.03, high=0.03,
-                            size=(dataSize, numUnits)))
+                rng.normal(scale=0.1,
+                           size=(dataSize, numUnits)))
         self.initial_bias = np.asarray(
-                rng.uniform(low=-0.01, high=0.01,
+                rng.uniform(low=0.0, high=0.0000000001,
                             size=(numUnits)))
         self.bias = theano.shared(self.initial_bias)
         self.weights = theano.shared(self.initial_weights)
@@ -128,9 +139,9 @@ def updateFunction(input, output, error, layers, lr):
                            error,
                            updates=updates)
 
-def testFunction(input, output, nll, softmax):
+def testFunction(input, output, nll, softmax, lay):
     return theano.function([input, output],
-                           [nll, softmax.output()])
+                           [nll, softmax.output(), lay.output()])
 
     
 initCharmap()
@@ -138,24 +149,28 @@ readTextFile()
 rng = np.random.RandomState(123)
 contextSize = 4
 input = inputLayer(contextSize*numChars)
-l1 = layer(input, 200, rng)
+l1 = layer(input, 400, rng)
 l1o = relu(l1)
-l2 = layer(l1o, 300, rng)
+l2 = layer(l1o, 400, rng)
 l2o = relu(l2)
-l3 = layer(l2o, 300, rng)
+l3 = layer(l2o, 400, rng)
 l3o = relu(l3)
-l4 = layer(l3o, 300, rng)
+l4 = layer(l3o, 400, rng)
 l4o = relu(l4)
-llast = layer(l4o, numChars, rng)
+l5 = layer(l4o, 400, rng)
+l5o = relu(l5)
+llast = layer(l5o, numChars, rng)
 output = softmax(llast)
 target = T.ivector('target')
 nll = negative_log_likelihood(output, target).output()
+rf = 0.00000001
 error = (negative_log_likelihood(output, target).output()
-         + l1.regularization(0.01)
-         + l2.regularization(0.01)
-         + l3.regularization(0.01)
-         + l4.regularization(0.01)
-         + llast.regularization(0.01))
+         + l1.regularization(rf)
+         + l2.regularization(rf)
+         + l3.regularization(rf)
+         + l4.regularization(rf)
+         + llast.regularization(rf)
+)
 
 
 lr = T.dscalar('lr')
@@ -170,13 +185,14 @@ testFunc = testFunction(
     input.output(),
     target,
     nll,
-    output)
+    output, llast)
 
-minibatchSize = 10
+minibatchSize = 100
 
-testingMinibatchSize = 100
-(testInputs, testOutputs) = prepareMinibatch(testingMinibatchSize,
-                                             contextSize, False)
+testingMinibatchSize = 1000
+(testInputs, testOutputs, titxt, totxt) = prepareMinibatch(
+    testingMinibatchSize,
+    contextSize, False)
 
 def r3(x):
     return round(x*1000)*0.001
@@ -184,8 +200,8 @@ def r3(x):
 trainingErrors = []
 t = 0
 while True:
-    (inputs, outputs) = prepareMinibatch(minibatchSize,
-                                         contextSize, True)
+    (inputs, outputs, it, ot) = prepareMinibatch(minibatchSize,
+                                                 contextSize, True)
     err = func(inputs, outputs, 0.01)
     trainingErrors.append(err)
     if t%100 == 0:
@@ -195,9 +211,14 @@ while True:
         tres = testFunc(testInputs, testOutputs)
         err = tres[0]
         print(t, 'testing:', r3(err), 'training:', r3(trainingErr))
+        # lo = tres[2]
+        # print(lo[0,::])
+        # print(lo[1,::])
+        # print(lo[2,::])
         sm = tres[1]
         smo = np.argsort(sm, axis=1)[:, ::-1]
-        for m in range(5):
-            print([(characters[smo[m,p]], r3(sm[m, smo[m,p]]))
-                   for p in range(3)])
+        for m in range(50):
+            print(titxt[m], totxt[m],
+                  [charidToChar(smo[m,p]) + " {:9.7f}".format(sm[m, smo[m,p]])
+                   for p in range(5)])
     t += 1
