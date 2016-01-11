@@ -13,9 +13,11 @@ def readTextFile():
         wholeText = textfile.read()
 
 global numChars, charmap, unknownChar
+global characters
+characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ \n\r,.:;\'"-()?! '
+
 def initCharmap():
-    global numChars, charmap, unknownChar
-    characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ \n\r,.:;\'"-()?! '
+    global numChars, charmap, unknownChar, characters
     unknownChar = len(characters)
     numChars = len(characters)+1
     charmap = dict(zip(characters, range(len(characters))))
@@ -126,13 +128,17 @@ def updateFunction(input, output, error, layers, lr):
                            error,
                            updates=updates)
 
+def testFunction(input, output, nll, softmax):
+    return theano.function([input, output],
+                           [nll, softmax.output()])
+
     
 initCharmap()
 readTextFile()
 rng = np.random.RandomState(123)
 contextSize = 4
 input = inputLayer(contextSize*numChars)
-l1 = layer(input, 700, rng)
+l1 = layer(input, 200, rng)
 l1o = relu(l1)
 l2 = layer(l1o, 300, rng)
 l2o = relu(l2)
@@ -160,16 +166,15 @@ func = updateFunction(
     [l1, l2, l3, l4, llast],
     lr)
 
-testFunc = updateFunction(
+testFunc = testFunction(
     input.output(),
     target,
     nll,
-    [l1, l2, l3, l4, llast],
-    lr)
+    output)
 
-minibatchSize = 100
+minibatchSize = 10
 
-testingMinibatchSize = 1000
+testingMinibatchSize = 100
 (testInputs, testOutputs) = prepareMinibatch(testingMinibatchSize,
                                              contextSize, False)
 
@@ -187,6 +192,12 @@ while True:
         trainingErr = np.mean(trainingErrors)
         trainingErrors = []
         
-        err = testFunc(testInputs, testOutputs, 0.0)
+        tres = testFunc(testInputs, testOutputs)
+        err = tres[0]
         print(t, 'testing:', r3(err), 'training:', r3(trainingErr))
+        sm = tres[1]
+        smo = np.argsort(sm, axis=1)[:, ::-1]
+        for m in range(5):
+            print([(characters[smo[m,p]], r3(sm[m, smo[m,p]]))
+                   for p in range(3)])
     t += 1
